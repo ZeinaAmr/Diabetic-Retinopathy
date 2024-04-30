@@ -1,0 +1,687 @@
+import json
+import os
+import pickle
+import time
+from collections import defaultdict
+from functools import cached_property
+from typing import Dict
+
+import torch
+from sklearn.metrics import roc_auc_score
+from torch.utils.data import DataLoader, Dataset
+
+# from .survivalreg.label_coder import LabelCoder
+# from .survivalreg.model import ModelProgression
+# from .survivalreg.util.config import Config, Parser
+from typing import Any
+import os
+import json
+
+
+class Parser(object):
+    def _init_(self,
+                 name: str, default: Any = None,
+                 type_: callable = None, help_info: str = None):
+        self.name = name
+        self.default = default
+        self.type_ = type_
+        self.help = help_info
+
+    def _set_(self, instance, value):
+        setattr(self, 'value', value)
+
+    def _get_(self, instance, owner):
+        if hasattr(self, 'value'):
+            return getattr(self, 'value')
+        v = os.environ.get(self.name, self.default)
+        if self.type_ is not None and self.name in os.environ:
+            v = self.type_(v)
+        setattr(self, 'value', v)
+        return v
+
+    def _call_(self, s):
+        if self.type_ is not None:
+            return self.type_(s)
+        return s
+
+    def _str_(self):
+        return f'<{self.name}: {self.help} default:{self.default}>'
+
+    def _repr_(self) -> str:
+        return self._str_()
+
+
+class Config(object):
+    def _init_(self):
+        pass
+
+    @property
+    def value_dict(self):
+        return self.search_cfg_recursively(self.class_)
+
+    @staticmethod
+    def _search_cfg_recursively(root):
+        vals = dict()
+        for base in root._bases_:
+            vals.update(Config._search_cfg_recursively(base))
+        for k, v in root._dict_.items():
+            if isinstance(v, Parser):
+                vals[k] = v._get_(None, None)
+        return vals
+
+    def _repr_(self):
+        return f'<{self._class.name_}: {json.dumps(self.value_dict)}>'
+
+    def sample_cfg(self):
+        for k, v in self._class.dict_.items():
+            if isinstance(v, Parser):
+                print(f'{k}={v.default} ', end='')
+        print()
+
+
+class TrainerConfig(Config):
+    debug = Parser('debug', False,
+                   lambda x: not x.lower().startswith('f'), 'debug mode ')
+    load_pretrain = Parser('load_pretrain', None, str, 'load pretrained model')
+    batch_size = Parser('batch_size', 32, int, 'batch size')
+    epochs = Parser('epochs', 100, int, 'number of max epochs to train')
+    image_size = Parser('image_size', 512, int, 'image size')
+    lr = Parser('lr', 0.001, float, 'learning rate')
+    device = Parser('device', 'cuda:0', str, 'device')
+    num_workers = Parser('num_workers', 4, int, 'number of workers')
+    model = Parser('model', 'resnet50', str, 'backbone model')
+
+
+class Trainer():
+    cfg = TrainerConfig()
+    # label_coder: LabelCoder = None
+
+    def _init_(self) -> None:
+        print(self._class_)
+        tt = time.gmtime()
+        self.running_uuid = f'{tt.tm_year}{tt.tm_mon:02d}{tt.tm_mday:02d}_{tt.tm_hour:02d}{tt.tm_min:02d}{tt.tm_sec:02d}'
+        print('running_uuid', self.running_uuid)
+        print(self.cfg)
+        self.epoch = None
+        self._result_cache: defaultdict = None
+        self._pretrain_loaded = False
+
+    def _get_cfg_recursive(self, cls=None):
+        if cls is None:
+            cls = self._class_
+        parent_cfg = Config()
+        for parent in cls._bases_:
+            parent_cfg._dict_.update(
+                self.get_cfg_recursive(parent).dict_)
+        if hasattr(cls, '_cfg'):
+            cfg = cls._cfg()
+            parent_cfg._dict.update(cfg.dict_)
+        return parent_cfg
+
+    @cached_property
+    def logger_dir(self):
+        logger_dir = f'logs/{self._class.name}{self.running_uuid}'
+        if self.cfg.debug:
+            logger_dir = f'logs/debug_{self.running_uuid}'
+        if not os.path.exists(logger_dir):
+            os.makedirs(logger_dir)
+        last_link_dir = f'logs/{self._class.name_}_last'
+        if os.path.islink(last_link_dir):
+            os.remove(last_link_dir)
+        os.symlink(
+            f'{self._class.name}{self.running_uuid}', last_link_dir)
+        return logger_dir
+
+    @cached_property
+    def training_log(self):
+        training_log = open(os.path.join(
+            self.logger_dir, f'training_log.txt'), 'w')
+        return training_log
+
+    @cached_property
+    def model(self):
+        raise NotImplementedError
+
+    @cached_property
+    def train_dataset(self) -> Dataset:
+        raise NotImplementedError
+
+    @cached_property
+    def test_dataset(self) -> Dataset:
+        raise NotImplementedError
+
+    @cached_property
+    def train_loader(self) -> DataLoader:
+        loader = DataLoader(
+            self.train_dataset,
+            batch_size=self.cfg.batch_size,
+            shuffle=True,
+            num_workers=self.cfg.num_workers,
+        )
+        return loader
+
+    @cached_property
+    def test_loader(self) -> DataLoader:
+        loader = DataLoader(
+            self.test_dataset,
+            batch_size=self.cfg.batch_size,
+            shuffle=False,
+            num_workers=self.cfg.num_workers,
+        )
+        return loader
+
+    @cached_property
+    def device(self):
+        if self.cfg.device.startswith('cuda') and not torch.cuda.is_available():
+            print('cuda is not available, using CPU mode')
+            self.cfg.device = 'cpu'
+        device = torch.device(self.cfg.device)
+        return device
+
+    @cached_property
+    def optimizer(self):
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.cfg.lr)
+        return optimizer
+
+    @cached_property
+    def criterion(self):
+        raise NotImplementedError
+
+    @cached_property
+    def scheduler(self):
+        sch = torch.optim.lr_scheduler.StepLR(
+            self.optimizer, step_size=20, gamma=0.1)
+        self.optimizer.zero_grad()
+        self.optimizer.step()
+        return sch
+
+    def batch(self, epoch, i_batch, data) -> dict:
+        x1, x2, l1, l2, dt = data
+        code_1 = self.label_coder(l1)
+        code_2 = self.label_coder(l2)
+        x1 = x1.to(torch.float32).to(self.device)
+        x2 = x2.to(torch.float32).to(self.device)
+        code_1 = code_1.to(torch.float32).to(self.device)
+        code_2 = code_2.to(torch.float32).to(self.device)
+        dt = dt.to(torch.float32).to(self.device)
+        y1 = self.model(x1)
+        y2 = self.model(x2)
+        loss = self.criterion(y1, y2, code_1, code_2, dt)
+        return dict(
+            loss=loss,
+            y1=y1,
+            y2=y2,
+            code_1=code_1,
+            code_2=code_2,
+            dt=dt,
+        )
+
+    def matrix(self, epoch, data) -> dict:
+        mean_loss = torch.mean(data['loss']).item()
+        n_auc = data['code_1'].size(1)
+        mat_dict = {'mean_loss': mean_loss}
+        pred = torch.cat([data['y1'], data['y2']])
+        label = torch.cat([data['code_1'], data['code_2']])
+        for i in range(n_auc):
+            try:
+                mat_dict[f'auc_{i}'] = roc_auc_score(
+                    label[:, i] > 0, pred[:, i])
+            except Exception as e:
+                print(e)
+        return mat_dict
+
+    def collect_result(self, output: Dict):
+        if self._result_cache is None:
+            self._result_cache = defaultdict(list)
+        for k, v in output.items():
+            self._result_cache[k].append(v.detach().cpu())
+
+    def merge_result(self):
+        collected = {}
+        for k, v in self._result_cache.items():
+            if len(v[0].shape) == 0:
+                collected[k] = torch.stack(v)
+            else:
+                collected[k] = torch.cat(v)
+        self._result_cache.clear()
+        return collected
+
+    def train(self):
+        print(self.cfg, file=self.training_log)
+        print(self.scheduler)
+        print(self.optimizer)
+        for epoch in range(self.cfg.epochs):
+            self.epoch = epoch
+            self.model.train()
+            self.model.to(self.device)
+            for i_batch, batch_data in enumerate(self.train_loader):
+                self.optimizer.zero_grad()
+                output = self.batch(epoch, i_batch, batch_data)
+                loss = output['loss']
+                loss.backward()
+                self.optimizer.step()
+
+                print(f'training {self.running_uuid} epoch:{epoch}/{self.cfg.epochs} '
+                      f'batch {i_batch}/{len(self.train_loader)} {loss}', end='\r')
+                print(json.dumps(dict(
+                    type='train',
+                    epoch=epoch,
+                    ibatch=i_batch,
+                    loss=float(loss),
+                )), file=self.training_log)
+                self.training_log.flush()
+                self.collect_result(output)
+                if self.cfg.debug and i_batch > 20:
+                    break
+            self.scheduler.step()
+            torch.save(self.model.state_dict(), os.path.join(
+                self.logger_dir, f'model_{epoch:03d}.pth'))
+            # calculate matrix training
+            metrix = self.matrix(epoch=self.epoch, data=self.merge_result())
+            # print(metrix)
+            metrix.update(dict(
+                type='train matrix',
+                epoch=self.epoch,
+            ))
+            print(json.dumps(metrix), file=self.training_log)
+            self.training_log.flush()
+            print('epoch train mat ', self.epoch, end=' ')
+            for k, v in metrix.items():
+                print(f'{k}: {v}', end=' ')
+            print()
+
+            self.test()
+            if self.cfg.debug:
+                break
+
+    def predict(self, dataset):
+        self.model.eval()
+        self.model.to(self.device)
+        with torch.no_grad():
+            for i_batch, data in enumerate(dataset):
+                output = self.batch(epoch=self.epoch, i_batch=-1, data=data)
+                self.collect_result(output)
+                print(
+                    f'predicting {self.running_uuid} epoch:{self.epoch}/'
+                    f'{self.cfg.epochs} batch {i_batch}/{len(dataset)}',
+                    end=' \r')
+                if self.cfg.debug and i_batch > 2:
+                    break
+        merged_output = self.merge_result()
+        return merged_output
+
+    def test(self):
+        merged_output = self.predict(dataset=self.test_loader)
+        metrix = self.matrix(epoch=self.epoch, data=merged_output)
+        metrix.update(dict(
+            type='test matrix',
+            epoch=self.epoch,
+        ))
+        print(json.dumps(metrix), file=self.training_log)
+        self.training_log.flush()
+        print('Test epoch', self.epoch, end=' ')
+        for k, v in metrix.items():
+            print(f'{k}: {v}', end=' ')
+        print()
+        pickle.dump(merged_output, open(os.path.join(
+            self.logger_dir, f'preds_{self.epoch}.pkl'), 'wb'))
+
+
+
+
+
+
+
+# %%
+from collections import defaultdict
+from typing import Any, Dict, Union, List, Tuple, Callable
+from torch.nn import Module
+import torch.nn as nn
+from torchvision.models.resnet import resnet50, resnet18, resnet101
+from torchvision.models import convnext_tiny
+import torch
+import torch.nn.functional as F
+from dataclasses import dataclass
+from torchvision.models.vision_transformer import vit_b_16
+from abc import ABC, abstractclassmethod
+
+
+class Hooks(Module):
+    def _init_(self, **kwargs) -> None:
+        super()._init_()
+        self.init(**kwargs)
+
+    def init(self):
+        pass
+
+    def forward_hook_func(self, module: nn.Module, input: Any, output: Any) -> Any:
+        raise NotImplementedError()
+
+
+class AttentionHook(Hooks):
+    def init(self, n_channels):
+        self.query, self.key, self.value = (
+            self._conv(n_channels, c)
+            for c in (1, 1, n_channels)
+        )
+        self.gamma = nn.Parameter(torch.FloatTensor([0.]))
+        self.last_attention = None
+
+    def _conv(self, n_in, n_out):
+        return nn.Conv1d(
+            n_in,
+            n_out,
+            kernel_size=1,
+            bias=False
+        )
+
+    def forward_hook_func(self, module: Module, input: Any, output: Any) -> Any:
+        x = output
+        size = x.size()
+        x = x.view(*size[:2], -1)
+        # X: B x C x WH
+        f, g, h = self.query(x), self.key(x), self.value(x)
+        # f: B C
+        beta = F.softmax(torch.bmm(f.transpose(1, 2), g), dim=1)
+        o = (1-self.gamma) * torch.bmm(h, beta) + self.gamma * x
+        o = o.view(*size).contiguous()
+        self.last_attention = beta
+        return o
+
+
+@dataclass
+class ModelDef():
+    backbone: nn.Module
+    output_size: int
+    hooks: List[Tuple[str, Module, Hooks]]
+
+
+def _backbone_resnet18(*args, **kwargs):
+    model = resnet18(*args, **kwargs)
+    model.fc = nn.Identity()
+    return ModelDef(
+        model,
+        512,
+        [
+            ('attention', model.layer3, AttentionHook(n_channels=256))
+        ],
+    )
+
+
+def _backbone_resnet50(*args, **kwargs):
+    model = resnet50(*args, **kwargs)
+    model.fc = nn.Identity()
+    return ModelDef(
+        model,
+        2048,
+        [
+            ('attention', model.layer3, AttentionHook(n_channels=1024))
+        ],
+    )
+
+
+class ModelProgression(Module):
+    def _init_(self, backbone='resnet50', output_size=20, with_hooks=None, ** kwargs):
+        super()._init_()
+        model_def: ModelDef = globals(
+        )[f'backbone{backbone}'](**kwargs)
+        backbone = model_def.backbone
+        feat_size = model_def.output_size
+        self.hooks = model_def.hooks
+        self.backbone = backbone
+        self.drop_out = nn.Dropout()
+
+        self.fc = nn.Sequential(
+            nn.LayerNorm(feat_size, eps=1e-6, elementwise_affine=True),
+            nn.Flatten(start_dim=1, end_dim=-1),
+            nn.Linear(feat_size, output_size, bias=True),
+        )
+        # register hooks
+        if with_hooks is None:
+            with_hooks = set(['attention'])
+        else:
+            with_hooks = set(with_hooks)
+        cnt_dict = defaultdict(lambda: 0)
+        for hook_name, hook_module, hook in model_def.hooks:
+            if hook_name in with_hooks:
+                setattr(self, f'hook{hook_name}_{cnt_dict[hook_name]}', hook)
+                if hook._class_.forward_hook_func != Hooks.forward_hook_func:
+                    hook_module.register_forward_hook(hook.forward_hook_func)
+                cnt_dict[hook_name] = cnt_dict[hook_name] + 1
+
+        self.forward_feat = {}
+        self.attention_map = {}
+
+    def forward(self, x):
+        self.forward_feat.clear()
+        self.attention_map.clear()
+        feat = self.backbone(x)
+        feat = feat.view(feat.shape[0], -1)
+        feat = self.drop_out(feat)
+        out = self.fc(feat)
+        return out
+
+
+if _name_ == "_main_":
+    m = ModelProgression(backbone='resnet50', with_hooks=['attention'])
+    output = m(torch.randn(3, 3, 512, 512))
+    print(output.shape)
+
+# %%
+
+
+
+
+
+
+import math
+from model import ModelProgression
+from torch import nn
+import torch
+import numpy as np
+from functools import cached_property
+from trainer import Trainer
+from torch.utils.data import Dataset
+import pandas as pd
+import cv2
+import albumentations as aug
+import albumentations.pytorch as aug_torch
+
+
+class DeepSurModel(nn.Module):
+    def _init_(self, K=512) -> None:
+        super()._init_()
+        self.K = K
+        # sample parameters for the mixture model
+        rnd = np.random.RandomState(12345)
+        b = torch.FloatTensor(abs(rnd.normal(0, 10, (1, 1, self.K))+5.0))
+        k = torch.FloatTensor(abs(rnd.normal(0, 10, (1, 1, self.K))+5.0))
+        self.register_buffer('b', b)
+        self.register_buffer('k', k)
+
+        self.cnn = ModelProgression(backbone='resnet50', output_size=512)
+
+    def _cdf_at(self, t):
+        # pdf: nBatch * n * K
+        pdf = 1 - torch.exp(-(1/self.b * (t)) ** self.k)
+        return pdf
+
+    def _pdf_at(self, t):
+        # pdf: nBatch * n * K
+        pdf = self._cdf_at(t)
+        pdf = (1-pdf) * self.k * (1/self.b)(t/self.b)*(self.k-1)
+        return pdf
+
+    def calculate_cdf(self, w, t):
+        """
+        Calculates the cumulative probability distribution function (CDF)
+        for the given data.
+
+        param w: nBatch * K: weights for mixture model
+        param t: nBatch * n: target time to calculate pdf at
+        return: nBatch * n: pdf values
+        """
+        t = t.unsqueeze(dim=2)
+        w = nn.functional.softmax(w, dim=1)
+        w = w.unsqueeze(dim=1)
+        pdf = self._cdf_at(t)
+        pdf = pdf * w
+        pdf = pdf.sum(dim=2)
+        return pdf
+
+    def calculate_pdf(self, w, t):
+        """
+        Calculates the probability distribution function (pdf) for the given
+        data.
+
+        param w: nBatch * K: weights for mixture model
+        param t: nBatch * n: target time to calculate pdf at
+        return: nBatch * n: pdf values
+        """
+        t = t.unsqueeze(dim=2)
+        w = nn.functional.softmax(w, dim=1)
+        w = w.unsqueeze(dim=1)
+        pdf = self._pdf_at(t)
+        pdf = pdf * w
+        pdf = pdf.sum(dim=2)
+        return pdf
+
+    def calculate_survival_time(self, w, t_max=10, resolution=20):
+        """
+        Calculates the survival time for the given data.
+        """
+        t = torch.linspace(
+            1/resolution,
+            t_max,
+            math.ceil(resolution*t_max)-1,
+            dtype=torch.float32,
+            device=w.device).view(1, -1)
+        pdf = self.calculate_pdf(w, t)
+        est = t.view(-1)[torch.argmax(pdf, dim=1)]
+        return est
+
+    def forward(self, x, t=None):
+        x = self.cnn(x)
+        if t is None:
+            return x
+        return x, self.calculate_cdf(x, t)
+class ProgressionData(Dataset):
+
+    def _init_(self, datasheet, transform):
+        super()._init_()
+        self.df = pd.read_csv(datasheet)
+        self.transform = transform
+
+    def _len_(self):
+        return len(self.df)
+
+    def _getitem_(self, idx):
+        img_file = self.df.iloc[idx]['image']
+        try:
+            image = cv2.imread(img_file, cv2.IMREAD_COLOR)
+            if image is None:
+                raise FileNotFoundError(f"Failed to load image: {img_file}")
+            image = self.transform(image=image)['image']
+        except Exception as e:
+            print(f"Error loading image: {img_file}. {e}")
+            return None
+
+        return dict(
+            image=image,
+            t1=self.df.iloc[idx]['t1'],
+            t2=self.df.iloc[idx]['t2'],
+            e=self.df.iloc[idx]['e'],
+            # simulation only
+            gt=self.df.iloc[idx]['gt'] if 'gt' in self.df.columns else 0,
+        )
+class TrainerDR(Trainer):
+
+    @cached_property
+    def model(self):
+        model = DeepSurModel().to(self.device)
+        if self.cfg.load_pretrain is not None:
+            print('loading ', self.cfg.load_pretrain)
+            print(model.cnn.backbone.load_state_dict(
+                torch.load(self.cfg.load_pretrain, map_location=self.device)
+            ))
+        return model
+
+    @cached_property
+    def beta(self):
+        return 1
+
+    @cached_property
+    def train_dataset(self):
+        transform = aug.Compose([
+            aug.SmallestMaxSize(
+                max_size=self.cfg.image_size, always_apply=True),
+            aug.CenterCrop(self.cfg.image_size, self.cfg.image_size,
+                           always_apply=True),
+            aug.Flip(p=0.5),
+            aug.ImageCompression(quality_lower=10, quality_upper=80, p=0.2),
+            aug.MedianBlur(p=0.3),
+            aug.RandomBrightnessContrast(p=0.5),
+            aug.RandomGamma(p=0.2),
+            aug.GaussNoise(p=0.2),
+            aug.Rotate(border_mode=cv2.BORDER_CONSTANT,
+                       value=0, p=0.7, limit=45),
+            aug.ToFloat(always_apply=True),
+            aug_torch.ToTensorV2(),
+        ])
+        return ProgressionData('/content/DeepDR_Plus/data_fund/train.csv', transform)
+
+    @cached_property
+    def test_dataset(self):
+        transform = aug.Compose([
+            aug.SmallestMaxSize(
+                max_size=self.cfg.image_size, always_apply=True),
+            aug.CenterCrop(self.cfg.image_size, self.cfg.image_size,
+                           always_apply=True),
+            aug.ToFloat(always_apply=True),
+            aug_torch.ToTensorV2(),
+        ])
+        return ProgressionData('/content/DeepDR_Plus/data_fund/test.csv', transform)
+
+    @cached_property
+    def optimizer(self):
+        optimizer = torch.optim.Adam(
+            self.model.parameters(), lr=self.cfg.lr, weight_decay=1e-5)
+        return optimizer
+
+    def batch(self, epoch, i_batch, data) -> dict:
+        # get and prepare data elements
+        imgs = data['image'].to(self.device)
+        t1 = data['t1'].to(self.device)
+        t2 = data['t2'].to(self.device)
+        e = data['e'].to(self.device)
+
+        w, P = self.model(imgs, torch.stack([t1, t2], dim=1))
+        P1 = P[:, 0]
+        P2 = P[:, 1]
+        loss = -torch.log(1-P1 + 0.000001) - torch.log(P2 +
+                                                       0.000001) * self.beta * (e)
+        loss += torch.abs(w).mean() * 0.00000001
+        time_to_cal = torch.linspace(0, 20, 240).to(
+            self.cfg.device).view(1, -1)
+        cdf = self.model.calculate_cdf(w, time_to_cal)
+        pdf = self.model.calculate_pdf(w, time_to_cal)
+        survival_time = self.model.calculate_survival_time(w)
+        return dict(
+            loss=loss.mean(),
+            pdf=pdf,
+            cdf=cdf,
+            t1=t1,
+            t2=t2,
+            survival_time=survival_time,
+            gt=data['gt'],
+        )
+
+    def matrix(self, epoch, data) -> dict:
+        return dict(
+            loss=float(data['loss'].mean())
+        )
+
+
+if _name_ == '_main_':
+    trainer = TrainerDR()
+    trainer.train()
